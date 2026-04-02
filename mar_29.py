@@ -2,12 +2,18 @@ import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+# LLM
 from langchain_groq import ChatGroq
 
+# Core
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage
 
+# Memory
 from langchain_community.chat_message_histories import ChatMessageHistory
+
 
 # -----------------------------
 # 🔐 LOAD ENV
@@ -28,16 +34,30 @@ llm = ChatGroq(
 history = ChatMessageHistory()
 
 # -----------------------------
-# 🛠 TOOL (WEB SEARCH SIMULATION)
+# 🛠 TOOL
 # -----------------------------
-def search_web(query: str):
+from langchain_core.tools import tool
+
+@tool
+def search_web(query: str) -> str:
+    """
+    Search dermatology-related information.
+    Use ONLY short, specific queries (max 10 words).
+    """
+    query = query[:100]  # hard limit safety
+
     return f"[WEB RESULT] Dermatology info about: {query}"
 
+tools = [search_web]
+
+# Bind tools to LLM (IMPORTANT)
+llm_with_tools = llm.bind_tools(tools)
+
 # -----------------------------
-# 📊 STRUCTURED OUTPUT (PYDANTIC)
+# 📊 STRUCTURED OUTPUT
 # -----------------------------
 class DermatologyReport(BaseModel):
-    patient_summary: str = Field(description="Summary")
+    patient_summary: str
     key_observations: str
     possible_conditions: str
     recommended_actions: str
@@ -46,35 +66,34 @@ class DermatologyReport(BaseModel):
     explanation: str
 
 parser = PydanticOutputParser(pydantic_object=DermatologyReport)
-format_instructions = parser.get_format_instructions()
 
 # -----------------------------
-# 🧾 PROMPT (AGENT-LIKE LOGIC)
+# 🧾 PROMPT
 # -----------------------------
 prompt = ChatPromptTemplate.from_messages([
-    ("system", f"""
+    ("system", """
 You are a Dermatologist AI.
 
-WORKFLOW:
-1. Ask questions if info is insufficient
-2. If needed, request web search using:
-   SEARCH: <query>
-3. If enough info → generate final report
+RULES:
+- Do NOT overuse tools
+- Use tools ONLY if absolutely necessary
+- Tool query must be SHORT (max 5–10 words)
+- DO NOT repeat phrases
 
-IMPORTANT:
-Return JSON ONLY for final report.
+If enough information is available → DO NOT call tools.
 
-{format_instructions}
+Final answer must be JSON only.
 """),
     ("human", "{input}")
 ])
 
-chain = prompt | llm
+chain = prompt | llm_with_tools
+
 
 # -----------------------------
 # 🚀 MAIN LOOP
 # -----------------------------
-print("🧑‍⚕️ LangChain Dermatology System Started\n")
+print("🧑‍⚕️ Modern LangChain Agent Started\n")
 
 while True:
     user_input = input("\nEnter input (or exit): ")
@@ -82,30 +101,38 @@ while True:
     if user_input.lower() == "exit":
         break
 
-    # Add user message to history
     history.add_user_message(user_input)
 
-    # Combine history manually
-    conversation = "\n".join([
-        f"{msg.type}: {msg.content}" for msg in history.messages
-    ])
+    # Build conversation
+    messages = []
+    for msg in history.messages:
+        if msg.type == "human":
+            messages.append(HumanMessage(content=msg.content))
+        else:
+            messages.append(AIMessage(content=msg.content))
 
-    # Run model
-    response = chain.invoke({"input": conversation})
+    # Invoke model
+    response = chain.invoke({"input": user_input})
+
+    # Handle tool calls
+    response = chain.invoke({"input": user_input})
+
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tool_call in response.tool_calls:
+            query = tool_call["args"].get("query", "")
+
+            # 🚨 Guard: prevent long queries
+            if len(query.split()) > 10:
+                print("\n⚠️ Tool blocked: query too long\n")
+                continue
+
+            result = search_web.invoke({"query": query})
+
+            print("\n🔎 TOOL USED:\n", result)
+            history.add_ai_message(result)
+            continue
+
     output = response.content
-
-    # -----------------------------
-    # 🔍 TOOL HANDLING (SIMULATED AGENT)
-    # -----------------------------
-    if "SEARCH:" in output:
-        query = output.split("SEARCH:")[-1].strip()
-
-        tool_result = search_web(query)
-
-        print("\n🔎 TOOL USED:\n", tool_result)
-
-        history.add_ai_message(f"[TOOL RESULT]: {tool_result}")
-        continue
 
     print("\n=== RESPONSE ===\n")
     print(output)
@@ -113,7 +140,7 @@ while True:
     history.add_ai_message(output)
 
     # -----------------------------
-    # 🧪 PARSE STRUCTURED OUTPUT
+    # 🧪 STRUCTURED OUTPUT
     # -----------------------------
     try:
         structured = parser.parse(output)
@@ -122,4 +149,4 @@ while True:
         print(structured.model_dump())
 
     except Exception:
-        print("\n⚠️ Not structured output yet (still Q&A phase)")
+        print("\n⚠️ Not structured output yet")
