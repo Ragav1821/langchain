@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # LLM
 from langchain_groq import ChatGroq
@@ -8,12 +8,9 @@ from langchain_groq import ChatGroq
 # Core
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
 
 # Memory
 from langchain_community.chat_message_histories import ChatMessageHistory
-
 
 # -----------------------------
 # 🔐 LOAD ENV
@@ -34,29 +31,18 @@ llm = ChatGroq(
 history = ChatMessageHistory()
 
 # -----------------------------
-# 🛠 TOOL
+# 🧠 STATE
 # -----------------------------
-from langchain_core.tools import tool
-
-@tool
-def search_web(query: str) -> str:
-    """
-    Search dermatology-related information.
-    Use ONLY short, specific queries (max 10 words).
-    """
-    query = query[:100]  # hard limit safety
-
-    return f"[WEB RESULT] Dermatology info about: {query}"
-
-tools = [search_web]
-
-# Bind tools to LLM (IMPORTANT)
-llm_with_tools = llm.bind_tools(tools)
+state = {
+    "stage": "questioning",
+    "questions_asked": 0,
+    "answers": {}
+}
 
 # -----------------------------
 # 📊 STRUCTURED OUTPUT
 # -----------------------------
-class DermatologyReport(BaseModel):
+class HairLossReport(BaseModel):
     patient_summary: str
     key_observations: str
     possible_conditions: str
@@ -65,35 +51,68 @@ class DermatologyReport(BaseModel):
     follow_up: str
     explanation: str
 
-parser = PydanticOutputParser(pydantic_object=DermatologyReport)
+parser = PydanticOutputParser(pydantic_object=HairLossReport)
+format_instructions = parser.get_format_instructions()
 
 # -----------------------------
-# 🧾 PROMPT
+# 🧾 PROMPTS
 # -----------------------------
-prompt = ChatPromptTemplate.from_messages([
+
+# QUESTION PROMPT
+question_prompt = ChatPromptTemplate.from_messages([
     ("system", """
-You are a Dermatologist AI.
+You are a professional Trichologist AI.
+
+Ask ONLY ONE question at a time.
 
 RULES:
-- Do NOT overuse tools
-- Use tools ONLY if absolutely necessary
-- Tool query must be SHORT (max 5–10 words)
-- DO NOT repeat phrases
+- Do NOT give diagnosis
+- Do NOT give suggestions
+- Ask relevant next question based on previous answers
+- Avoid repeating questions
 
-If enough information is available → DO NOT call tools.
-
-Final answer must be JSON only.
+Focus areas:
+- duration
+- hair loss pattern
+- stress
+- diet
+- scalp condition
+- medical history
 """),
     ("human", "{input}")
 ])
 
-chain = prompt | llm_with_tools
+question_chain = question_prompt | llm
+
+
+# REPORT PROMPT
+report_prompt = ChatPromptTemplate.from_messages([
+    ("system", f"""
+You are a professional Trichologist AI.
+
+Based on user answers, generate:
+
+1. Clear explanation (human readable)
+2. Structured JSON report
+
+RULES:
+- No medical claims
+- No prescriptions
+- Simple language for general users
+
+STRICT FORMAT:
+{format_instructions}
+"""),
+    ("human", "User answers: {answers}")
+])
+
+report_chain = report_prompt | llm
 
 
 # -----------------------------
-# 🚀 MAIN LOOP
+# 🔁 MAIN LOOP
 # -----------------------------
-print("🧑‍⚕️ Modern LangChain Agent Started\n")
+print("🧑‍⚕️ Hair Loss Trichologist AI Started\n")
 
 while True:
     user_input = input("\nEnter input (or exit): ")
@@ -101,52 +120,60 @@ while True:
     if user_input.lower() == "exit":
         break
 
+    # Save user input
     history.add_user_message(user_input)
 
-    # Build conversation
-    messages = []
-    for msg in history.messages:
-        if msg.type == "human":
-            messages.append(HumanMessage(content=msg.content))
-        else:
-            messages.append(AIMessage(content=msg.content))
+    # -----------------------------
+    # 🧠 QUESTIONING STAGE
+    # -----------------------------
+    if state["stage"] == "questioning":
 
-    # Invoke model
-    response = chain.invoke({"input": user_input})
+        # Store answer
+        if state["questions_asked"] > 0:
+            state["answers"][f"q{state['questions_asked']}"] = user_input
 
-    # Handle tool calls
-    response = chain.invoke({"input": user_input})
+        # Ask next question
+        response = question_chain.invoke({"input": user_input})
+        output = response.content
 
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        for tool_call in response.tool_calls:
-            query = tool_call["args"].get("query", "")
+        print("\n🤖 QUESTION:\n")
+        print(output)
 
-            # 🚨 Guard: prevent long queries
-            if len(query.split()) > 10:
-                print("\n⚠️ Tool blocked: query too long\n")
-                continue
+        history.add_ai_message(output)
 
-            result = search_web.invoke({"query": query})
+        state["questions_asked"] += 1
 
-            print("\n🔎 TOOL USED:\n", result)
-            history.add_ai_message(result)
-            continue
-
-    output = response.content
-
-    print("\n=== RESPONSE ===\n")
-    print(output)
-
-    history.add_ai_message(output)
+        # Move to report after 4 questions
+        if state["questions_asked"] >= 4:
+            state["stage"] = "reporting"
 
     # -----------------------------
-    # 🧪 STRUCTURED OUTPUT
+    # 📊 REPORTING STAGE
     # -----------------------------
-    try:
-        structured = parser.parse(output)
+    elif state["stage"] == "reporting":
 
-        print("\n✅ STRUCTURED OUTPUT:\n")
-        print(structured.model_dump())
+        response = report_chain.invoke({
+            "answers": str(state["answers"])
+        })
 
-    except Exception:
-        print("\n⚠️ Not structured output yet")
+        output = response.content
+
+        print("\n=== FINAL REPORT ===\n")
+        print(output)
+
+        # Validate JSON
+        try:
+            structured = parser.parse(output)
+            print("\n✅ STRUCTURED OUTPUT:\n")
+            print(structured.model_dump())
+        except Exception as e:
+            print("\n❌ JSON PARSE FAILED:", e)
+
+        # Reset state for next session
+        state = {
+            "stage": "questioning",
+            "questions_asked": 0,
+            "answers": {}
+        }
+
+        history.clear()
