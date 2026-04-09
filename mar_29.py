@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from typing import Optional
 
 # LLM
 from langchain_groq import ChatGroq
@@ -8,9 +9,6 @@ from langchain_groq import ChatGroq
 # Core
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
-
-# Memory
-from langchain_community.chat_message_histories import ChatMessageHistory
 
 # -----------------------------
 # 🔐 LOAD ENV
@@ -26,21 +24,35 @@ llm = ChatGroq(
 )
 
 # -----------------------------
-# 🧠 MEMORY
-# -----------------------------
-history = ChatMessageHistory()
-
-# -----------------------------
 # 🧠 STATE
 # -----------------------------
 state = {
     "stage": "questioning",
-    "questions_asked": 0,
-    "answers": {}
+    "answers": {
+        "duration": None,
+        "pattern": None,
+        "lifestyle": None,
+        "diet": None,
+        "scalp": None
+    }
 }
 
 # -----------------------------
-# 📊 STRUCTURED OUTPUT
+# 📊 EXTRACTION SCHEMA
+# -----------------------------
+class Extraction(BaseModel):
+    duration: Optional[str] = None
+    pattern: Optional[str] = None
+    lifestyle: Optional[str] = None
+    diet: Optional[str] = None
+    scalp: Optional[str] = None
+
+extract_parser = PydanticOutputParser(pydantic_object=Extraction)
+extract_format = extract_parser.get_format_instructions()
+extract_format = extract_format.replace("{", "{{").replace("}", "}}")
+
+# -----------------------------
+# 📊 FINAL REPORT SCHEMA
 # -----------------------------
 class HairLossReport(BaseModel):
     patient_summary: str
@@ -51,66 +63,117 @@ class HairLossReport(BaseModel):
     follow_up: str
     explanation: str
 
-parser = PydanticOutputParser(pydantic_object=HairLossReport)
-format_instructions = parser.get_format_instructions()
+report_parser = PydanticOutputParser(pydantic_object=HairLossReport)
+report_format = report_parser.get_format_instructions()
+report_format = report_format.replace("{", "{{").replace("}", "}}")
 
 # -----------------------------
-# 🧾 PROMPTS
+# 🤖 EXTRACTION PROMPT
 # -----------------------------
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", f"""
+You are a trichology data extraction AI.
 
-# QUESTION PROMPT
-question_prompt = ChatPromptTemplate.from_messages([
-    ("system", """
-You are a professional Trichologist AI.
+Extract structured data from user input.
 
-Ask ONLY ONE question at a time.
+Fields:
+- duration
+- pattern
+- lifestyle
+- diet
+- scalp
 
 RULES:
-- Do NOT give diagnosis
-- Do NOT give suggestions
-- Ask relevant next question based on previous answers
-- Avoid repeating questions
+- Extract only if clearly mentioned
+- Do NOT guess
+- Return null if not present
 
-Focus areas:
-- duration
-- hair loss pattern
-- stress
-- diet
-- scalp condition
-- medical history
+FORMAT:
+{extract_format}
 """),
     ("human", "{input}")
 ])
 
+extract_chain = extract_prompt | llm
+
+# -----------------------------
+# 🤖 QUESTION PROMPT
+# -----------------------------
+question_prompt = ChatPromptTemplate.from_messages([
+    ("system", """
+You are a Trichologist AI.
+
+Ask ONE intelligent question.
+
+RULES:
+- Ask ONLY ONE question
+- Do NOT repeat known info
+- Focus on missing fields only
+- No advice or diagnosis
+- Keep it simple
+
+Fields:
+duration, pattern, lifestyle, diet, scalp
+"""),
+    ("human", """
+Known answers:
+{answers}
+
+Missing fields:
+{missing}
+""")
+])
+
 question_chain = question_prompt | llm
 
-
-# REPORT PROMPT
+# -----------------------------
+# 🤖 REPORT PROMPT
+# -----------------------------
 report_prompt = ChatPromptTemplate.from_messages([
     ("system", f"""
 You are a professional Trichologist AI.
 
-Based on user answers, generate:
+Based on user data:
 
-1. Clear explanation (human readable)
-2. Structured JSON report
+1. Explain cause of hair loss
+2. Suggest safe actions
 
 RULES:
 - No medical claims
 - No prescriptions
-- Simple language for general users
+- Simple language
 
 STRICT FORMAT:
-{format_instructions}
+{report_format}
 """),
-    ("human", "User answers: {answers}")
+    ("human", "User data: {answers}")
 ])
 
 report_chain = report_prompt | llm
 
+# -----------------------------
+# 🧠 HELPERS
+# -----------------------------
+def extract_info_llm(user_input):
+    try:
+        response = extract_chain.invoke({"input": user_input})
+        parsed = extract_parser.parse(response.content)
+        data = parsed.model_dump()
+
+        for key, value in data.items():
+            if value and state["answers"][key] is None:
+                state["answers"][key] = value
+
+    except Exception as e:
+        print("⚠️ Extraction error:", e)
+
+
+def get_missing_fields():
+    return [k for k, v in state["answers"].items() if v is None]
+
 
 # -----------------------------
-# 🔁 MAIN LOOP
+# 🚀 MAIN LOOP
 # -----------------------------
 print("🧑‍⚕️ Hair Loss Trichologist AI Started\n")
 
@@ -120,37 +183,37 @@ while True:
     if user_input.lower() == "exit":
         break
 
-    # Save user input
-    history.add_user_message(user_input)
+    # -----------------------------
+    # 🧠 EXTRACT INFO
+    # -----------------------------
+    extract_info_llm(user_input)
 
     # -----------------------------
-    # 🧠 QUESTIONING STAGE
+    # 🔍 CHECK MISSING
+    # -----------------------------
+    missing = get_missing_fields()
+
+    # -----------------------------
+    # 🤖 QUESTIONING STAGE
     # -----------------------------
     if state["stage"] == "questioning":
 
-        # Store answer
-        if state["questions_asked"] > 0:
-            state["answers"][f"q{state['questions_asked']}"] = user_input
+        if missing:
+            response = question_chain.invoke({
+                "answers": state["answers"],
+                "missing": missing
+            })
 
-        # Ask next question
-        response = question_chain.invoke({"input": user_input})
-        output = response.content
+            print("\n🤖 QUESTION:\n")
+            print(response.content)
 
-        print("\n🤖 QUESTION:\n")
-        print(output)
-
-        history.add_ai_message(output)
-
-        state["questions_asked"] += 1
-
-        # Move to report after 4 questions
-        if state["questions_asked"] >= 4:
+        else:
             state["stage"] = "reporting"
 
     # -----------------------------
     # 📊 REPORTING STAGE
     # -----------------------------
-    elif state["stage"] == "reporting":
+    if state["stage"] == "reporting":
 
         response = report_chain.invoke({
             "answers": str(state["answers"])
@@ -161,19 +224,27 @@ while True:
         print("\n=== FINAL REPORT ===\n")
         print(output)
 
-        # Validate JSON
+        # -----------------------------
+        # ✅ VALIDATE JSON
+        # -----------------------------
         try:
-            structured = parser.parse(output)
+            structured = report_parser.parse(output)
             print("\n✅ STRUCTURED OUTPUT:\n")
             print(structured.model_dump())
-        except Exception as e:
-            print("\n❌ JSON PARSE FAILED:", e)
 
-        # Reset state for next session
+        except Exception as e:
+            print("\n❌ JSON FAILED:", e)
+
+        # RESET
         state = {
             "stage": "questioning",
-            "questions_asked": 0,
-            "answers": {}
+            "answers": {
+                "duration": None,
+                "pattern": None,
+                "lifestyle": None,
+                "diet": None,
+                "scalp": None
+            }
         }
 
-        history.clear()
+        print("\n🔄 Session reset\n")
